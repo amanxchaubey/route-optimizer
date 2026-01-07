@@ -12,6 +12,7 @@ class RouteFinder {
    * Main function to find optimal routes between source and destination
    */
   async findRoutes(sourceCoords, destCoords, preferences = {}) {
+    console.log('🎯 findRoutes called!');
     try {
       // Validate coordinates
       this.validateCoordinates(sourceCoords);
@@ -66,6 +67,7 @@ class RouteFinder {
       throw error;
     }
   }
+  
 
   /**
    * Find nearby stations within max distance
@@ -79,67 +81,79 @@ class RouteFinder {
    */
   async buildTransitGraph() {
     const routes = await Route.find({ isActive: true });
+    const stations = await Station.find({ isActive: true });
     const graph = new Map();
-    const stationCache = new Map();
+    
+    // Create a map of stations by ID for quick lookup
+    const stationById = new Map();
+    for (const station of stations) {
+      stationById.set(station._id.toString(), station);
+    }
 
-    // First, create stations from route stops if they don't exist
-    for (const route of routes) {
-      for (const stop of route.stops) {
-        const stopKey = `${stop.coordinates.lat},${stop.coordinates.lng}`;
+    // Helper function to find closest station to coordinates
+    const findClosestStation = (lat, lng, maxDistance = 50) => {
+      let closestStation = null;
+      let minDistance = maxDistance;
+      
+      for (const station of stations) {
+        const stationLat = station.location.coordinates[1];
+        const stationLng = station.location.coordinates[0];
+        const distance = this.calculateDistance([lng, lat], [stationLng, stationLat]);
         
-        if (!stationCache.has(stopKey)) {
-          // Find or create station for this stop
-          let station = await Station.findOne({
-            name: stop.name,
-            'location.coordinates': [stop.coordinates.lng, stop.coordinates.lat]
-          });
-
-          if (!station) {
-            station = await Station.create({
-              name: stop.name,
-              type: route.type === 'metro' ? 'metro' : 'bus_stop',
-              location: {
-                type: 'Point',
-                coordinates: [stop.coordinates.lng, stop.coordinates.lat]
-              },
-              lines: [route.routeNumber],
-              isActive: true
-            });
-          }
-
-          stationCache.set(stopKey, station);
+        if (distance < minDistance) {
+          minDistance = distance;
+          closestStation = station;
         }
       }
-    }
+      
+      return closestStation;
+    };
+
+    console.log(`🔧 Building graph with ${routes.length} routes and ${stations.length} stations`);
 
     // Build graph from routes
     for (const route of routes) {
+      let connectionsAdded = 0;
+      
       for (let i = 0; i < route.stops.length - 1; i++) {
         const currentStop = route.stops[i];
         const nextStop = route.stops[i + 1];
 
-        const fromKey = `${currentStop.coordinates.lat},${currentStop.coordinates.lng}`;
-        const toKey = `${nextStop.coordinates.lat},${nextStop.coordinates.lng}`;
+        // Find closest stations (with tolerance for coordinate differences)
+        const fromStation = findClosestStation(
+          currentStop.coordinates.lat, 
+          currentStop.coordinates.lng
+        );
+        const toStation = findClosestStation(
+          nextStop.coordinates.lat, 
+          nextStop.coordinates.lng
+        );
 
-        const fromStation = stationCache.get(fromKey);
-        const toStation = stationCache.get(toKey);
-
-        if (!fromStation || !toStation) continue;
+        if (!fromStation || !toStation) {
+          console.log(`⚠️  Could not find stations for ${currentStop.name} -> ${nextStop.name}`);
+          continue;
+        }
 
         const fromId = fromStation._id.toString();
         const toId = toStation._id.toString();
 
-        // Convert your coordinate format to [lng, lat]
+        // Convert coordinates to [lng, lat]
         const fromCoords = [currentStop.coordinates.lng, currentStop.coordinates.lat];
         const toCoords = [nextStop.coordinates.lng, nextStop.coordinates.lat];
 
         // Calculate edge weight
         const weight = this.calculateEdgeWeight(route, fromCoords, toCoords);
 
+        // Initialize graph nodes if they don't exist
         if (!graph.has(fromId)) {
           graph.set(fromId, []);
         }
+        if (!graph.has(toId)) {
+          graph.set(toId, []);
+        }
 
+        // Add BIDIRECTIONAL edges (this is the key fix!)
+        // Forward edge
         graph.get(fromId).push({
           to: toId,
           route: route,
@@ -150,8 +164,38 @@ class RouteFinder {
           fromStop: currentStop,
           toStop: nextStop
         });
+
+        // Backward edge (reverse direction)
+        graph.get(toId).push({
+          to: fromId,
+          route: route,
+          weight: weight,
+          distance: weight.distance,
+          time: weight.time,
+          fare: weight.fare,
+          fromStop: nextStop,
+          toStop: currentStop
+        });
+        
+        connectionsAdded += 2; // Count both directions
+      }
+      
+      console.log(`📍 Route ${route.routeNumber}: Added ${connectionsAdded} connections`);
+    }
+
+    console.log(`✅ Graph built with ${graph.size} nodes\n`);
+    
+    // Show graph connections
+    console.log('📊 Graph connections:');
+    let totalConnections = 0;
+    for (const [nodeId, connections] of graph.entries()) {
+      totalConnections += connections.length;
+      if (connections.length > 0) {
+        const station = stationById.get(nodeId);
+        console.log(`  ${station?.name || nodeId}: ${connections.length} connections`);
       }
     }
+    console.log(`\n✅ Total: ${totalConnections} connections across ${graph.size} nodes\n`);
 
     return graph;
   }
@@ -187,6 +231,11 @@ class RouteFinder {
    * Find optimal route using modified Dijkstra algorithm
    */
   async findOptimalRoute(graph, sourceStations, destStations, sourceCoords, destCoords, criterion) {
+    console.log(`\n🔍 Finding ${criterion} route`);
+    console.log(`📍 Source stations: ${sourceStations.length}`);
+    console.log(`📍 Dest stations: ${destStations.length}`);
+    console.log(`📊 Graph size: ${graph.size}`);
+    
     let bestRoute = null;
     let bestCost = Infinity;
 
@@ -245,6 +294,18 @@ class RouteFinder {
    * Dijkstra's algorithm for shortest path
    */
   dijkstra(graph, startId, endId, criterion) {
+    console.log(`\n🚀 Running Dijkstra from ${startId} to ${endId}`);
+    
+    // Verify nodes exist in graph
+    if (!graph.has(startId)) {
+      console.log(`❌ Start node ${startId} not found in graph`);
+      return null;
+    }
+    if (!graph.has(endId)) {
+      console.log(`❌ End node ${endId} not found in graph`);
+      return null;
+    }
+    
     const distances = new Map();
     const previous = new Map();
     const unvisited = new Set(graph.keys());
@@ -275,7 +336,15 @@ class RouteFinder {
         }
       }
 
-      if (currentNode === null || currentNode === endId) break;
+      if (currentNode === null || minDistance === Infinity) {
+        console.log(`❌ No reachable nodes left`);
+        break;
+      }
+
+      if (currentNode === endId) {
+        console.log(`✅ Reached destination!`);
+        break;
+      }
 
       unvisited.delete(currentNode);
 
@@ -310,8 +379,12 @@ class RouteFinder {
     }
 
     // Reconstruct path
-    if (!previous.has(endId)) return null;
-
+    if (!previous.has(endId)) {
+      console.log(`❌ No path found from ${startId} to ${endId}`);
+      return null;
+    }
+    
+    console.log(`✅ Path found!`);
     const path = [];
     let current = endId;
 
